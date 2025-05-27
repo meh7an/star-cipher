@@ -1,9 +1,15 @@
-name: Release Build
+name: Manual or Tag-Based Release
 
 on:
   push:
     tags:
-      - 'v*'  # Triggers on version tags like v1.0.0
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v1.2.3)'
+        required: true
+        default: 'v1.0.0'
 
 jobs:
   release:
@@ -31,7 +37,7 @@ jobs:
       - name: 🛠️ Build
         run: make
 
-      - name: 📦 Rename binary for release
+      - name: 📦 Prepare binary
         run: |
           mkdir release
           cp bin/star_cipher release/star_cipher-${{ runner.os }}
@@ -39,6 +45,7 @@ jobs:
       - name: 🚀 Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
           files: release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
