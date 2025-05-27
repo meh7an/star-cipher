@@ -1,0 +1,44 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers on version tags like v1.0.0
+
+jobs:
+  release:
+    name: Release on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🧰 Setup build tools (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          sudo apt update || true
+          sudo apt install -y build-essential || true
+
+      - name: 🧰 Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 🛠️ Build
+        run: make
+
+      - name: 📦 Rename binary for release
+        run: |
+          mkdir release
+          cp bin/star_cipher release/star_cipher-${{ runner.os }}
+
+      - name: 🚀 Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
