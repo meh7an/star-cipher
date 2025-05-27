@@ -40,7 +40,14 @@ jobs:
       - name: 📦 Prepare binary
         run: |
           mkdir release
-          cp bin/star_cipher release/star_cipher-${{ runner.os }}
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp bin/star_cipher.exe release/star_cipher-windows.exe
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            cp bin/star_cipher release/star_cipher-macos
+          else
+            cp bin/star_cipher release/star_cipher-linux
+          fi
+        shell: bash
 
       - name: 🚀 Create GitHub Release
         uses: softprops/action-gh-release@v2
