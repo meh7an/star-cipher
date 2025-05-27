@@ -5,9 +5,19 @@
 #include <ctype.h>
 #include <time.h>
 
+// Add stb_image for JPEG/PNG support
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #define STAR_DIM 50
 #define STAR_BRIGHT 255
 #define STAR_BRIGHT_THRESHOLD 200
+
+// Adaptive thresholds for different formats
+#define JPEG_STAR_MIN_THRESHOLD 25      // Much lower for JPEG
+#define JPEG_BRIGHT_THRESHOLD 120       // More forgiving bright star detection
+#define BMP_STAR_MIN_THRESHOLD 40       // Original threshold for BMP
+#define PNG_STAR_MIN_THRESHOLD 35       // PNG is lossless but may have some artifacts
 
 // Hash function for password-based randomization
 void simple_hash(const char* input, uint32_t* hash_output) {
@@ -380,10 +390,12 @@ void save_photo_bmp(StarPhoto* photo, const char* filename, const char* message)
     printf("Image saved as %s\n", filename);
 }
 
-// Decoder structures and functions
+// Enhanced decoder structures and functions
 typedef struct {
     int width, height;
     uint8_t* pixels;
+    char* metadata_json;  // Store metadata as JSON string for non-BMP formats
+    int format_type;      // 1=BMP, 2=JPEG, 3=PNG
 } DecodedPhoto;
 
 typedef struct {
@@ -391,6 +403,117 @@ typedef struct {
     int brightness;
 } DetectedStar;
 
+// Function to detect file format
+int get_file_format(const char* filename) {
+    const char* ext = strrchr(filename, '.');
+    if(!ext) return 0; // Unknown
+    
+    if(strcasecmp(ext, ".bmp") == 0) return 1;
+    if(strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0) return 2;
+    if(strcasecmp(ext, ".png") == 0) return 3;
+    
+    return 0; // Unknown format
+}
+
+// Convert RGB to grayscale
+uint8_t rgb_to_gray(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint8_t)(0.299 * r + 0.587 * g + 0.114 * b);
+}
+
+// Modified load function to accept grid size parameter
+DecodedPhoto* load_image_stb_with_grid(const char* filename, int provided_grid_size, int* grid_size, int* square_size, int* message_length) {
+    int width, height, channels;
+    unsigned char* data = stbi_load(filename, &width, &height, &channels, 0);
+    
+    if(!data) {
+        printf("Error: Could not load image %s\n", filename);
+        printf("stb_image error: %s\n", stbi_failure_reason());
+        return NULL;
+    }
+    
+    int format = get_file_format(filename);
+    const char* format_name = (format == 2) ? "JPEG" : (format == 3) ? "PNG" : "Unknown";
+    
+    printf("Loaded %s (%s): %dx%d pixels, %d channels\n", filename, format_name, width, height, channels);
+    
+    if(format == 2) {
+        printf("JPEG detected - using adaptive brightness thresholds for lossy compression\n");
+    }
+    
+    DecodedPhoto* photo = malloc(sizeof(DecodedPhoto));
+    photo->width = width;
+    photo->height = height;
+    photo->pixels = malloc(width * height);
+    photo->metadata_json = NULL;
+    photo->format_type = format;
+    
+    // Convert to grayscale
+    for(int y = 0; y < height; y++) {
+        for(int x = 0; x < width; x++) {
+            int src_idx = (y * width + x) * channels;
+            int dst_idx = y * width + x;
+            
+            if(channels == 1) {
+                // Already grayscale
+                photo->pixels[dst_idx] = data[src_idx];
+            } else if(channels >= 3) {
+                // RGB or RGBA
+                uint8_t r = data[src_idx];
+                uint8_t g = data[src_idx + 1];
+                uint8_t b = data[src_idx + 2];
+                photo->pixels[dst_idx] = rgb_to_gray(r, g, b);
+            }
+        }
+    }
+    
+    stbi_image_free(data);
+    
+    // Use provided grid size or ask for it
+    if(provided_grid_size > 0) {
+        *grid_size = provided_grid_size;
+        printf("Using provided grid size: %dx%d\n", *grid_size, *grid_size);
+    } else {
+        printf("This appears to be a %s file.\n", format_name);
+        printf("Since metadata isn't embedded, we need to determine the grid parameters.\n");
+        
+        char input[100];
+        printf("Grid size (how many squares per row/column, e.g., 10 for 10x10): ");
+        fgets(input, sizeof(input), stdin);
+        *grid_size = atoi(input);
+        
+        if(*grid_size <= 0) {
+            printf("Invalid grid size, using default 10\n");
+            *grid_size = 10;
+        }
+    }
+    
+    // Calculate square size from image dimensions and grid size
+    int calculated_square_x = width / *grid_size;
+    int calculated_square_y = height / *grid_size;
+    
+    // Use the smaller dimension to ensure squares fit properly
+    *square_size = (calculated_square_x < calculated_square_y) ? calculated_square_x : calculated_square_y;
+    
+    // Calculate maximum possible message length from grid
+    int max_squares = (*grid_size) * (*grid_size);
+    *message_length = max_squares; // Use all available squares
+    
+    printf("Calculated parameters:\n");
+    printf("  Image size: %dx%d pixels\n", width, height);
+    printf("  Grid size: %dx%d (%d squares)\n", *grid_size, *grid_size, max_squares);
+    printf("  Calculated square size: %d pixels\n", *square_size);
+    printf("  Max message length: %d characters\n", max_squares);
+    
+    // Verify the calculated parameters make sense
+    if(*square_size < 30) {
+        printf("Warning: Square size is very small (%d pixels). Detection may be unreliable.\n", *square_size);
+        printf("Consider using a smaller grid size or a larger image.\n");
+    }
+    
+    return photo;
+}
+
+// Original BMP loader (unchanged for compatibility)
 DecodedPhoto* load_bmp(const char* filename, int* grid_size, int* square_size, int* message_length) {
     FILE* file = fopen(filename, "rb");
     if(!file) {
@@ -420,9 +543,9 @@ DecodedPhoto* load_bmp(const char* filename, int* grid_size, int* square_size, i
         *grid_size = info.grid_size;
         *square_size = info.square_size;
         *message_length = info.message_length;
-        printf("Star Cipher file detected\n");
+        printf("Star Cipher BMP file detected\n");
     } else {
-        printf("Warning: Not a Star Cipher file\n");
+        printf("Warning: Not a Star Cipher BMP file\n");
         fclose(file);
         return NULL;
     }
@@ -431,6 +554,8 @@ DecodedPhoto* load_bmp(const char* filename, int* grid_size, int* square_size, i
     photo->width = info.width;
     photo->height = info.height;
     photo->pixels = malloc(photo->width * photo->height);
+    photo->metadata_json = NULL;
+    photo->format_type = 1; // BMP format
     
     int row_size = ((photo->width * 3 + 3) / 4) * 4;
     int padding_size = row_size - photo->width * 3;
@@ -449,13 +574,44 @@ DecodedPhoto* load_bmp(const char* filename, int* grid_size, int* square_size, i
     }
     
     fclose(file);
-    printf("Loaded image: %dx%d pixels\n", photo->width, photo->height);
+    printf("Loaded BMP image: %dx%d pixels\n", photo->width, photo->height);
     return photo;
 }
 
+// Universal image loader that handles all formats
+DecodedPhoto* load_image_universal(const char* filename, int provided_grid_size, int* grid_size, int* square_size, int* message_length) {
+    int format = get_file_format(filename);
+    
+    switch(format) {
+        case 1: // BMP
+            return load_bmp(filename, grid_size, square_size, message_length);
+        case 2: // JPEG
+        case 3: // PNG
+            return load_image_stb_with_grid(filename, provided_grid_size, grid_size, square_size, message_length);
+        default:
+            printf("Error: Unsupported file format. Supported: BMP, JPEG, PNG\n");
+            return NULL;
+    }
+}
+
+// Adaptive star detection based on image format
 int detect_stars_in_square(DecodedPhoto* photo, int grid_x, int grid_y, int square_size, DetectedStar* stars) {
     int star_count = 0;
     int third_square = square_size / 3;
+    
+    // Choose threshold based on format type
+    int min_threshold;
+    switch(photo->format_type) {
+        case 2: // JPEG
+            min_threshold = JPEG_STAR_MIN_THRESHOLD;
+            break;
+        case 3: // PNG
+            min_threshold = PNG_STAR_MIN_THRESHOLD;
+            break;
+        default: // BMP
+            min_threshold = BMP_STAR_MIN_THRESHOLD;
+            break;
+    }
     
     for(int mini = 1; mini <= 9; mini++) {
         int mini_row = (mini - 1) / 3;
@@ -465,21 +621,41 @@ int detect_stars_in_square(DecodedPhoto* photo, int grid_x, int grid_y, int squa
         int mini_y = mini_row * third_square;
         
         int max_brightness = 0;
+        int avg_brightness = 0;
+        int pixel_count = 0;
+        
         int start_x = grid_x * square_size + mini_x;
         int start_y = grid_y * square_size + mini_y;
         int end_x = start_x + third_square;
         int end_y = start_y + third_square;
         
+        // For JPEG, we also calculate average brightness in the region
         for(int y = start_y; y < end_y && y < photo->height; y++) {
             for(int x = start_x; x < end_x && x < photo->width; x++) {
                 int brightness = photo->pixels[y * photo->width + x];
                 if(brightness > max_brightness) {
                     max_brightness = brightness;
                 }
+                avg_brightness += brightness;
+                pixel_count++;
             }
         }
         
-        if(max_brightness > 40) {
+        if(pixel_count > 0) {
+            avg_brightness /= pixel_count;
+        }
+        
+        // For JPEG, use a combination of max brightness and average brightness
+        // to be more tolerant of compression artifacts
+        int detection_score = max_brightness;
+        if(photo->format_type == 2) { // JPEG
+            // Boost detection if average is also elevated (indicates a real star region)
+            if(avg_brightness > min_threshold / 2) {
+                detection_score = max_brightness + (avg_brightness / 4);
+            }
+        }
+        
+        if(detection_score > min_threshold) {
             stars[star_count].mini_square = mini;
             stars[star_count].brightness = max_brightness;
             star_count++;
@@ -519,7 +695,7 @@ int compare_positions(int* pos1, int* pos2, int count) {
     return 1;
 }
 
-char decode_square(DetectedStar* stars, int star_count, LetterMapping* cipher_table, int table_size, int* is_capital) {
+char decode_square(DetectedStar* stars, int star_count, LetterMapping* cipher_table, int table_size, int* is_capital, int format_type) {
     if(star_count == 0) {
         return ' ';
     }
@@ -527,9 +703,12 @@ char decode_square(DetectedStar* stars, int star_count, LetterMapping* cipher_ta
     int detected_positions[4] = {0};
     int has_bright_star = 0;
     
+    // Choose brightness threshold based on format
+    int bright_threshold = (format_type == 2) ? JPEG_BRIGHT_THRESHOLD : STAR_BRIGHT_THRESHOLD;
+    
     for(int i = 0; i < star_count && i < 4; i++) {
         detected_positions[i] = stars[i].mini_square;
-        if(stars[i].brightness > STAR_BRIGHT_THRESHOLD) {
+        if(stars[i].brightness > bright_threshold) {
             has_bright_star = 1;
         }
     }
@@ -564,7 +743,7 @@ void decode_message(DecodedPhoto* photo, const char* password, char* decoded_mes
         int star_count = detect_stars_in_square(photo, grid_x, grid_y, square_size, stars);
         
         int is_capital;
-        char decoded_char = decode_square(stars, star_count, cipher_table, table_size, &is_capital);
+        char decoded_char = decode_square(stars, star_count, cipher_table, table_size, &is_capital, photo->format_type);
         
         if(decoded_char != '\0' && decoded_char != '?') {
             if(decoded_char != ' ' && !is_capital) {
@@ -593,6 +772,9 @@ void free_star_photo(StarPhoto* photo) {
 void free_decoded_photo(DecodedPhoto* photo) {
     if(photo) {
         free(photo->pixels);
+        if(photo->metadata_json) {
+            free(photo->metadata_json);
+        }
         free(photo);
     }
 }
@@ -604,29 +786,38 @@ typedef struct {
     char output_file[256];
     char password[256];
     char message[1000];
+    int grid_size;      // Grid size for non-BMP decoding
     int help;
 } Arguments;
 
 void print_help() {
-    printf("STAR CIPHER v1.0 - Hide messages in star patterns\n");
-    printf("================================================\n\n");
+    printf("STAR CIPHER v1.1 - Hide messages in star patterns\n");
+    printf("=================================================\n\n");
+    printf("SUPPORTED FORMATS:\n");
+    printf("  Encoding: BMP only\n");
+    printf("  Decoding: BMP, JPEG, PNG\n\n");
     printf("USAGE:\n");
     printf("  star-cipher [OPTIONS]\n\n");
     printf("OPTIONS:\n");
     printf("  -e, --encode          Encode mode (default if no input file)\n");
     printf("  -d, --decode          Decode mode (default if input file given)\n");
-    printf("  -i, --input FILE      Input BMP file to decode\n");
+    printf("  -i, --input FILE      Input image file to decode (BMP/JPEG/PNG)\n");
     printf("  -o, --output FILE     Output BMP file (default: encoded.bmp)\n");
     printf("  -p, --password PASS   Password for cipher\n");
     printf("  -m, --message TEXT    Message to encode\n");
+    printf("  -g, --grid SIZE       Grid size for JPEG/PNG decoding (e.g., 10 for 10x10)\n");
     printf("  -h, --help            Show this help\n\n");
     printf("EXAMPLES:\n");
     printf("  star-cipher -e -m \"Hello World\" -p mypass -o secret.bmp\n");
     printf("  star-cipher -d -i secret.bmp -p mypass\n");
+    printf("  star-cipher -d -i photo.jpg -p mypass -g 10\n");
+    printf("  star-cipher -d -i image.png -p mypass -g 15\n");
     printf("  star-cipher --encode --message \"Top Secret\" --password key123\n");
-    printf("  star-cipher --decode --input encrypted.bmp\n\n");
+    printf("  star-cipher --decode --input encrypted.jpg --grid 10\n\n");
     printf("INTERACTIVE MODE:\n");
-    printf("  Run without arguments for interactive menu\n");
+    printf("  Run without arguments for interactive menu\n\n");
+    printf("NOTE: JPEG/PNG decoding requires manual parameter input\n");
+    printf("      since these formats don't store cipher metadata.\n");
 }
 
 int parse_arguments(int argc, char* argv[], Arguments* args) {
@@ -636,6 +827,7 @@ int parse_arguments(int argc, char* argv[], Arguments* args) {
     args->input_file[0] = '\0';
     args->password[0] = '\0';
     args->message[0] = '\0';
+    args->grid_size = 0;
     args->help = 0;
     
     for(int i = 1; i < argc; i++) {
@@ -663,6 +855,9 @@ int parse_arguments(int argc, char* argv[], Arguments* args) {
             strcpy(args->message, argv[++i]);
             if(args->mode == 0) args->mode = 1; // Auto-detect encode mode
         }
+        else if((strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--grid") == 0) && i + 1 < argc) {
+            args->grid_size = atoi(argv[++i]);
+        }
         else {
             printf("Error: Unknown argument '%s'\n", argv[i]);
             printf("Use -h or --help for usage information\n");
@@ -684,6 +879,7 @@ void get_message(char* message, int max_len) {
     fgets(message, max_len, stdin);
     message[strcspn(message, "\n")] = 0;
 }
+
 void run_encoder_cli(Arguments* args) {
     char password[256];
     char message[1000];
@@ -719,7 +915,7 @@ void run_decoder_cli(Arguments* args) {
     
     // Get input filename
     if(strlen(args->input_file) == 0) {
-        printf("BMP filename: ");
+        printf("Image filename (BMP/JPEG/PNG): ");
         fgets(filename, sizeof(filename), stdin);
         filename[strcspn(filename, "\n")] = 0;
     } else {
@@ -734,7 +930,7 @@ void run_decoder_cli(Arguments* args) {
     }
     
     int grid_size, square_size, message_length;
-    DecodedPhoto* photo = load_bmp(filename, &grid_size, &square_size, &message_length);
+    DecodedPhoto* photo = load_image_universal(filename, args->grid_size, &grid_size, &square_size, &message_length);
     if(!photo) {
         return;
     }
@@ -742,16 +938,17 @@ void run_decoder_cli(Arguments* args) {
     char decoded_message[1000];
     decode_message(photo, password, decoded_message, sizeof(decoded_message), grid_size, square_size, message_length);
     
-    printf("Decoded message: %s\n", decoded_message);
+    printf("\nDecoded message: %s\n", decoded_message);
     
     free_decoded_photo(photo);
 }
 
 void run_interactive() {
-    printf("STAR CIPHER v1.0\n");
-    printf("================\n");
-    printf("1. Encode message\n");
-    printf("2. Decode message\n");
+    printf("STAR CIPHER v1.1\n");
+    printf("=================\n");
+    printf("Supports: BMP encoding/decoding, JPEG/PNG decoding\n\n");
+    printf("1. Encode message (creates BMP)\n");
+    printf("2. Decode message (BMP/JPEG/PNG)\n");
     printf("3. Exit\n");
     printf("Choice: ");
     
